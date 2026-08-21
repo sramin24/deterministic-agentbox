@@ -1,0 +1,46 @@
+name: probe-unprivileged-userns
+
+# Throwaway diagnostic, not a build gate. Answers one question before we sink
+# two weeks into the C engine: does the hosted runner's environment permit
+# unprivileged user namespaces at all? Some hosted runners are themselves
+# already namespaced/sandboxed in ways that block CLONE_NEWUSER independent
+# of the Ubuntu 24.04+ AppArmor restriction this project otherwise works
+# around. This never fails the job on its own -- it just prints a verdict.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/probe-userns.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: kernel/apparmor state
+        run: |
+          echo "kernel.unprivileged_userns_clone:"
+          sysctl kernel.unprivileged_userns_clone || echo "  (sysctl not present)"
+          echo "kernel.apparmor_restrict_unprivileged_userns:"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || echo "  (sysctl not present)"
+
+      - name: attempt unshare(CLONE_NEWUSER) + uid_map write
+        run: |
+          set +e
+          out=$(unshare --user --map-root-user id 2>&1)
+          rc=$?
+          echo "$out"
+          echo "exit code: $rc"
+          if [ $rc -eq 0 ]; then
+            echo "VERDICT: unprivileged userns WORKS unmodified on this runner"
+          else
+            echo "VERDICT: unprivileged userns BLOCKED on this runner (rc=$rc)"
+            echo "This matches the Ubuntu 24.04+ AppArmor restriction this project"
+            echo "targets with 'agentbox setup' -- confirms CI will also need that"
+            echo "one-time step (or an equivalent AppArmor profile load) before"
+            echo "make test-c / pytest can run unprivileged in this workflow."
+          fi
+          exit 0
+
+      - name: apparmor denial log (if visible)
+        run: |
+          dmesg 2>/dev/null | grep -i apparmor | tail -20 || echo "(dmesg not readable on this runner)"
