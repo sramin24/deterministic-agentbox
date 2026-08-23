@@ -127,6 +127,23 @@ void agentbox_free_string_list(char **paths, size_t count);
 agentbox_errcode_t agentbox_exec(agentbox_t *box, const char *cwd, const char *cmd,
                                   int timeout_sec, agentbox_exec_result_t *result);
 
+/*
+ * Called synchronously, from within agentbox_exec_streaming(), for every
+ * chunk of output the running command produces -- possibly many times
+ * before the command finishes. is_stderr distinguishes which stream a
+ * chunk came from (0 = stdout, 1 = stderr); data is NOT NUL-terminated and
+ * may contain arbitrary bytes, so len must be respected. Never called after
+ * agentbox_exec_streaming() returns.
+ */
+typedef void (*agentbox_stream_chunk_cb)(int is_stderr, const char *data, size_t len, void *userdata);
+
+/* Same contract as agentbox_exec(), plus live delivery of output as the
+ * command produces it (on_chunk may be NULL to skip streaming and just
+ * wait for the final result, same as agentbox_exec()). */
+agentbox_errcode_t agentbox_exec_streaming(agentbox_t *box, const char *cwd, const char *cmd,
+                                            int timeout_sec, agentbox_stream_chunk_cb on_chunk,
+                                            void *userdata, agentbox_exec_result_t *result);
+
 const char *agentbox_strerror(agentbox_errcode_t code);
 
 /* ---- Internal API (shared across engine .c files, not part of the ABI
@@ -149,9 +166,14 @@ agentbox_errcode_t agentbox_cow_commit_merge(const char *const *layer_dirs, size
 agentbox_errcode_t agentbox_cow_diff(const char *const *layer_dirs, size_t count,
                                       char ***out_paths, size_t *out_count);
 
-/* agentbox_proc.c */
+/* agentbox_proc.c: runs the command with its stdout/stderr connected to
+ * pipes (not files) so output can be forwarded as it's produced; each
+ * chunk read is both appended to stdout_path/stderr_path (so the full
+ * captured output is always available afterward, streamed or not) and,
+ * if on_chunk is non-NULL, handed to it immediately. */
 agentbox_errcode_t agentbox_proc_run(const char *cwd, const char *cmd, int timeout_sec,
                                       const char *stdout_path, const char *stderr_path,
+                                      agentbox_stream_chunk_cb on_chunk, void *userdata,
                                       agentbox_exec_result_t *result);
 
 /* agentbox_core.c: entry point called by agentbox_exec_main.c's main() after

@@ -103,6 +103,23 @@ static void send_err(int fd, agentbox_errcode_t code, const char *msg) {
     send_frame_str(fd, buf);
 }
 
+/* agentbox_proc_run()'s streaming callback, wired up only while a RUN is in
+ * flight: forwards each chunk of output to the client as its own frame,
+ * "CHUNK\n<O|E>\n<raw bytes>", the instant it's read from the command's
+ * pipe -- not after the command finishes. data is not NUL-terminated and
+ * may contain arbitrary bytes (including newlines), which is fine here
+ * since it's the last field of the frame and nothing parses past it. */
+static void send_chunk_to_client(int is_stderr, const char *data, size_t len, void *userdata) {
+    int fd = *(int *)userdata;
+    char *buf = malloc(len + 8);
+    memcpy(buf, "CHUNK\n", 6);
+    buf[6] = is_stderr ? 'E' : 'O';
+    buf[7] = '\n';
+    memcpy(buf + 8, data, len);
+    send_frame(fd, buf, len + 8);
+    free(buf);
+}
+
 /* ======================= supervisor-side state =========================
  * Everything below this point runs ONLY inside the exec'd agentbox-exec
  * process, after agentbox_ns_enter() has succeeded -- never in the
@@ -355,7 +372,8 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
             snprintf(stderr_path, sizeof(stderr_path), "%s/run_%d_stderr.txt", st.runtime_dir, st.run_counter);
             st.run_counter++;
             agentbox_exec_result_t result;
-            agentbox_errcode_t rc = agentbox_proc_run(st.merged_dir, cmd, timeout_sec, stdout_path, stderr_path, &result);
+            agentbox_errcode_t rc = agentbox_proc_run(st.merged_dir, cmd, timeout_sec, stdout_path, stderr_path,
+                                                       send_chunk_to_client, &ctrl_fd, &result);
             if (rc == AGENTBOX_OK) {
                 char buf[AGENTBOX_PATH_LEN * 2 + 128];
                 snprintf(buf, sizeof(buf), "%d\n%d\n%lld\n%s\n%s",
@@ -657,8 +675,9 @@ agentbox_errcode_t agentbox_diff(agentbox_t *box, char ***out_paths, size_t *out
     return AGENTBOX_OK;
 }
 
-agentbox_errcode_t agentbox_exec(agentbox_t *box, const char *cwd, const char *cmd,
-                                  int timeout_sec, agentbox_exec_result_t *result) {
+agentbox_errcode_t agentbox_exec_streaming(agentbox_t *box, const char *cwd, const char *cmd,
+                                            int timeout_sec, agentbox_stream_chunk_cb on_chunk,
+                                            void *userdata, agentbox_exec_result_t *result) {
     (void)cwd; /* commands always run at the sandbox root; see Part 5 note */
     size_t req_cap = strlen(cmd) + 64;
     char *req = malloc(req_cap);
@@ -667,27 +686,46 @@ agentbox_errcode_t agentbox_exec(agentbox_t *box, const char *cwd, const char *c
     free(req);
     if (rc != 0) return AGENTBOX_ERR_SUPERVISOR_DOWN;
 
-    size_t len = 0;
-    char *resp = recv_frame(box->ctrl_fd, &len);
-    if (!resp) return AGENTBOX_ERR_SUPERVISOR_DOWN;
+    for (;;) {
+        size_t len = 0;
+        char *resp = recv_frame(box->ctrl_fd, &len);
+        if (!resp) return AGENTBOX_ERR_SUPERVISOR_DOWN;
 
-    char *cursor = resp;
-    char *status = next_field(&cursor);
-    agentbox_errcode_t out_rc;
-    if (strcmp(status, "OK") == 0) {
-        memset(result, 0, sizeof(*result));
-        result->exit_code = atoi(next_field(&cursor));
-        result->timed_out = atoi(next_field(&cursor));
-        result->duration_ms = atoll(next_field(&cursor));
-        snprintf(result->stdout_path, sizeof(result->stdout_path), "%s", next_field(&cursor));
-        snprintf(result->stderr_path, sizeof(result->stderr_path), "%s", next_field(&cursor));
-        out_rc = AGENTBOX_OK;
-    } else {
-        char *code_str = next_field(&cursor);
-        out_rc = (agentbox_errcode_t)atoi(code_str);
+        char *cursor = resp;
+        char *status = next_field(&cursor);
+
+        if (strcmp(status, "CHUNK") == 0) {
+            /* "CHUNK\n<O|E>\n<raw bytes, length known from the frame, not
+             * NUL-scanned -- may contain anything>" */
+            char *which = next_field(&cursor);
+            int is_stderr = (which[0] == 'E');
+            size_t data_len = len - (size_t)(cursor - resp);
+            if (on_chunk) on_chunk(is_stderr, cursor, data_len, userdata);
+            free(resp);
+            continue;
+        }
+
+        agentbox_errcode_t out_rc;
+        if (strcmp(status, "OK") == 0) {
+            memset(result, 0, sizeof(*result));
+            result->exit_code = atoi(next_field(&cursor));
+            result->timed_out = atoi(next_field(&cursor));
+            result->duration_ms = atoll(next_field(&cursor));
+            snprintf(result->stdout_path, sizeof(result->stdout_path), "%s", next_field(&cursor));
+            snprintf(result->stderr_path, sizeof(result->stderr_path), "%s", next_field(&cursor));
+            out_rc = AGENTBOX_OK;
+        } else {
+            char *code_str = next_field(&cursor);
+            out_rc = (agentbox_errcode_t)atoi(code_str);
+        }
+        free(resp);
+        return out_rc;
     }
-    free(resp);
-    return out_rc;
+}
+
+agentbox_errcode_t agentbox_exec(agentbox_t *box, const char *cwd, const char *cmd,
+                                  int timeout_sec, agentbox_exec_result_t *result) {
+    return agentbox_exec_streaming(box, cwd, cmd, timeout_sec, NULL, NULL, result);
 }
 
 const char *agentbox_strerror(agentbox_errcode_t code) {

@@ -23,6 +23,21 @@
 
 static int g_failures = 0;
 
+#define MAX_RECORDED_CHUNKS 32
+static long long g_chunk_times_ms[MAX_RECORDED_CHUNKS];
+static int g_chunk_count = 0;
+
+static long long wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void record_chunk_timing(int is_stderr, const char *data, size_t len, void *userdata) {
+    (void)is_stderr; (void)data; (void)len; (void)userdata;
+    if (g_chunk_count < MAX_RECORDED_CHUNKS) g_chunk_times_ms[g_chunk_count++] = wall_ms();
+}
+
 static void check(int cond, const char *what) {
     if (cond) { printf("  PASS: %s\n", what); }
     else { printf("  FAIL: %s\n", what); g_failures++; }
@@ -76,6 +91,15 @@ int main(int argc, char **argv) {
     }
 
     const char *base = argc >= 2 ? argv[1] : "/tmp/agentbox_test_c_engine";
+    /* Start from a clean slate every run -- otherwise a previous run's
+     * commit (step 9) leaves newfile.txt/newdir sitting in the real
+     * workspace, and step 5's "nothing committed yet" check fails purely
+     * from stale leftovers, not an actual regression. */
+    {
+        char rm_cmd[4200];
+        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", base);
+        system(rm_cmd);
+    }
     char workspace[4096], file_path[4096], subdir_path[4096], subdir_file_path[4096];
     snprintf(workspace, sizeof(workspace), "%s/workspace", base);
     snprintf(file_path, sizeof(file_path), "%s/file.txt", workspace);
@@ -191,6 +215,31 @@ int main(int argc, char **argv) {
         agentbox_diff(&box, &paths, &count);
         check(count == 0, "diff is empty");
         agentbox_free_string_list(paths, count);
+    }
+
+    /* ---- live streaming: chunks arrive as produced, not all at the end --- */
+    printf("== live streaming: agentbox_exec_streaming delivers output as it happens ==\n");
+    {
+        g_chunk_count = 0;
+        long long call_start = wall_ms();
+        agentbox_exec_result_t result;
+        agentbox_exec_streaming(&box, NULL, "echo one; sleep 1; echo two; sleep 1; echo three",
+                                 10, record_chunk_timing, NULL, &result);
+        long long call_end = wall_ms();
+
+        check(g_chunk_count >= 3, "at least 3 chunks were delivered");
+        long long total_wall = call_end - call_start;
+        long long first_to_last = g_chunk_count >= 2
+            ? g_chunk_times_ms[g_chunk_count - 1] - g_chunk_times_ms[0] : 0;
+        printf("    chunks=%d total_call_ms=%lld first_to_last_chunk_ms=%lld\n",
+               g_chunk_count, total_wall, first_to_last);
+        /* If output were only buffered and delivered in one lump at the end
+         * (the old, non-streaming behavior), every chunk timestamp would
+         * cluster within a few ms of call_end, and first_to_last would be
+         * near 0 even though the command itself took ~2s. Seeing the
+         * chunks spread out over a large fraction of that 2s is the actual
+         * proof this is live, not just "eventually correct". */
+        check(first_to_last > 1500, "chunks are spread across the command's real ~2s runtime, not bunched at the end");
     }
 
     /* ---- 11: timeout + process-group cleanup ------------------------------ */
