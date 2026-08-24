@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-agentbox"
+version = "0.1.0"
+description = "Transactional, local-first execution sandbox for AI coding agents: zero-copy checkpoint and instant rollback for shell commands and file mutations, without Docker or root."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Sandboxing",
+]
+
+[project.urls]
+Repository = "https://github.com/sramin24/deterministic-agentbox"
+
+[project.scripts]
+agentbox = "agentbox.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["agentbox"]
+
+[tool.setuptools.package-data]
+agentbox = ["libagentbox.so", "agentbox-exec"]

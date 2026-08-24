@@ -1,6 +1,7 @@
 out/
 *.o
 *.so
+src/agentbox/agentbox-exec
 
 __pycache__/
 *.pyc
