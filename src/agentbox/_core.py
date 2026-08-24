@@ -60,13 +60,13 @@ STREAM_CALLBACK_TYPE = ctypes.CFUNCTYPE(
 def _find_library() -> str:
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(pkg_dir, "libagentbox.so"),  # installed package layout
-        os.path.join(pkg_dir, "..", "..", "out", "libagentbox.so"),  # repo checkout, `make build`
+        os.path.normpath(os.path.join(pkg_dir, "libagentbox.so")),  # installed package layout
+        os.path.normpath(os.path.join(pkg_dir, "..", "..", "out", "libagentbox.so")),  # repo checkout, `make build`
     ]
     for path in candidates:
         if os.path.isfile(path):
             return path
-    tried = "\n".join(f"  - {os.path.normpath(p)}" for p in candidates)
+    tried = "\n".join(f"  - {p}" for p in candidates)
     raise OSError(
         "Could not find libagentbox.so. Looked in:\n" + tried +
         "\n\nBuild it with `make build` from the repository root."
@@ -76,13 +76,13 @@ def _find_library() -> str:
 def _find_exec_binary() -> str:
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(pkg_dir, "agentbox-exec"),
-        os.path.join(pkg_dir, "..", "..", "out", "agentbox-exec"),
+        os.path.normpath(os.path.join(pkg_dir, "agentbox-exec")),
+        os.path.normpath(os.path.join(pkg_dir, "..", "..", "out", "agentbox-exec")),
     ]
     for path in candidates:
         if os.path.isfile(path):
             return path
-    tried = "\n".join(f"  - {os.path.normpath(p)}" for p in candidates)
+    tried = "\n".join(f"  - {p}" for p in candidates)
     raise OSError("Could not find the agentbox-exec binary. Looked in:\n" + tried)
 
 
