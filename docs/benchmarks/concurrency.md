@@ -3,13 +3,19 @@
 **Question:** how much does each concurrent agentbox Sandbox cost when you run many of them on one machine? Does that cost stay flat from 10 to 500 sandboxes? How does it compare with rootless Podman, the standard daemonless container alternative?
 
 **Verdict:**
-- **Both systems ran 500 concurrent sandboxes** on a 15 GB laptop without failing. Neither came close to running out of memory.
-- **agentbox is much faster.** At 500 sandboxes:
-  - it starts them 4x faster;
-  - it runs a command batch across all of them 11x faster, using 7.7x less CPU;
-  - it tears them down 37x faster.
-- **agentbox currently uses about 2x more memory per idle sandbox** (about 4.5 MB against Podman's 2.3 MB). Nearly all of that is fixed-size buffers sized for 256 checkpoints (see [Where agentbox's memory goes](#where-agentboxs-memory-goes)). It is not an inherent cost of the design, and it is fixable.
-- **"Run 100 agents on a laptop that would choke Docker" is not supported by this data.** "Lower latency and less CPU per agent command" is supported.
+- **Both systems ran 500 concurrent sandboxes** on a 15 GB laptop without failing.
+- **agentbox is lighter and much faster at every scale tested.** At 500 sandboxes:
+
+| At N = 500 | agentbox | Podman | |
+|---|---:|---:|---|
+| Memory, all 500 idle (`MemAvailable` drop) | 220 MB | 1.03 GB | 4.7x less |
+| Memory per sandbox | 0.44 MB | 2.05 MB | |
+| Start all 500 | 3.2 s | 42.3 s | 13x faster |
+| Run one command in all 500 at once | 2.9 s | 32.5 s | 11x faster |
+| CPU for that batch | 54 CPU-s | 435 CPU-s | 8x less |
+| Tear all 500 down | 1.5 s | 56.4 s | 38x faster |
+
+- **This depends on a fix made during this benchmark.** The first run found agentbox using about 2x *more* memory than Podman (4.6 MB per sandbox). Nearly all of that was fixed-size 256-checkpoint buffers, committed whether or not they were used. They were trimmed in `560874d`. See [Before the fix](#before-the-fix).
 
 ## Setup
 
@@ -18,10 +24,11 @@
 | | |
 |---|---|
 | Machine | WSL2, kernel 6.18.54.1-microsoft-standard-WSL2, 22 CPUs, 15.3 GB RAM, ext4 |
-| Power | Laptop on battery for the whole run, so absolute times are likely slower than when plugged in |
-| Software | Python 3.14.7, Podman 3.4.4 (rootless, native overlay storage, crun), `make build` at `bb74b55` |
+| Power | Laptop on battery for both runs, so absolute times are likely slower than when plugged in |
+| Power blip | Battery-saver mode came on for about 20 s during repeat 1 of the after-fix run. Every repeat-1 timing falls within the range of repeats 2–3, so the medians are unaffected. |
+| Software | Python 3.14.7, Podman 3.4.4 (rootless, native overlay storage, crun) |
 | Script | `PYTHONPATH=src python3 tests/benchmark_concurrency.py --out docs/benchmarks/concurrency-results.json` |
-| Raw data | [concurrency-results.json](concurrency-results.json), with every step of every repeat plus the summary |
+| Raw data | After the fix: [concurrency-results.json](concurrency-results.json). Before the fix (`4e99ce8`): [concurrency-results-before-fix.json](concurrency-results-before-fix.json). Each file holds every step of every repeat plus the summary. |
 
 **What one "sandbox" is:**
 - **agentbox:** one `Sandbox(fixture, runtime_dir=<unique>)`. All sandboxes are layered over one shared ~1,000-file fixture, the same fixture as `benchmark_latency.py`.
@@ -42,7 +49,7 @@
   find . -type f | xargs cat | md5sum
   ```
   agentbox runs it with `Sandbox.run()`; Podman with `podman exec`. The checksum must be identical in every sandbox, or the step fails.
-- **Failure rule:** a step fails on any error, if available memory drops below 1.5 GB, or if any phase takes more than 5 minutes. **No step failed.**
+- **Failure rule:** a step fails on any error, if available memory drops below 1.5 GB, or if any phase takes more than 5 minutes. **No step failed in either run.**
 
 **How memory is measured:**
 - **Headline:** the drop in system-wide `MemAvailable` while the sandboxes are open. It counts everything: processes, kernel mounts and namespaces, and the driver.
@@ -53,17 +60,17 @@
 
 **Not compared: Docker.** Docker Desktop on WSL runs its containers in a separate VM, whose memory isn't visible from this environment.
 
-## Results (median of 3)
+## Results (median of 3, after the fix)
 
 ### Idle footprint
 
 | N | agentbox MB/sandbox | Podman MB/sandbox | agentbox total | Podman total |
 |---:|---:|---:|---:|---:|
-| 10 | ~0 (noise: −2.2 … 7.9) | 9.5 (noise: −11.8 … 11.7) | — | — |
-| 50 | 1.4 | 7.3 | 68 MB | 365 MB |
-| 100 | 2.8 | 4.9 | 282 MB | 491 MB |
-| 250 | 4.3 | 3.2 | 1.08 GB | 0.81 GB |
-| 500 | 4.6 | 2.3 | 2.29 GB | 1.14 GB |
+| 10 | noise (−1.3 … 1.3) | noise (−7.6 … 10.3) | — | — |
+| 50 | 0.1 (−0.1 … 0.5) | 4.4 | ~5 MB | 218 MB |
+| 100 | 0.34 | 3.3 | 34 MB | 330 MB |
+| 250 | 0.24 | 3.3 | 60 MB | 820 MB |
+| 500 | 0.44 (0.39 … 0.47) | 2.05 (2.05 … 2.11) | 220 MB | 1.03 GB |
 
 How to read this table:
 - **Below about 100 sandboxes, the `MemAvailable` reading is mostly noise.** The ranges in brackets are wider than the values themselves.
@@ -71,69 +78,70 @@ How to read this table:
 
 | | agentbox | Podman |
 |---|---|---|
-| Sandbox processes, PSS per sandbox | 3.3 MB | 0.4 MB |
-| Driver memory growth per sandbox | 1.05 MB | ~0 |
-| **Measured processes, per sandbox** | **~4.4 MB** | **~0.4 MB** |
-| `MemAvailable` drop per sandbox at N=500 | 4.6 MB | 2.3 MB |
+| Sandbox processes, PSS per sandbox | 0.20 MB | 0.37 MB |
+| Driver memory growth per sandbox | ~0.008 MB | ~0 |
+| `MemAvailable` drop per sandbox at N=500 | 0.44 MB | 2.05 MB |
 
 What the second table shows:
-- **agentbox's cost is almost entirely in its own processes,** so it scales linearly at about 4.4 MB per sandbox.
-- **Podman's cost is mostly outside its own processes.** It sits in kernel-side and storage state (overlay mounts, namespaces, container storage). The per-sandbox figure falls as N grows because Podman's fixed costs are shared across more containers.
-- **Podman's idle figure may overstate its steady-state cost.** After the load phase, its total `MemAvailable` drop at N=500 was only 0.5 GB (about 1 MB per container), against 1.1 GB when idle. agentbox's stayed at about 2.3 GB.
+- **Both systems have flat per-process cost,** so both scale linearly.
+- **Most of each system's cost sits outside its own processes,** in kernel-side state: overlay mounts, namespaces and, for Podman, container storage and cgroup bookkeeping. Podman carries noticeably more of it.
+- **The gap narrows after the load phase but remains.** After load, the total `MemAvailable` drop at N=500 was 100–220 MB for agentbox and about 510 MB for Podman (~1 MB per container).
 
-**Idle CPU:** both are indistinguishable from zero. Background CPU on this WSL machine varied between 0.06 and 0.83 cores from step to step, which swamps any difference. Both designs block in `read()`/`pause()`/`poll()` while idle, so zero is expected.
+**Idle CPU:** both are indistinguishable from zero. Background CPU on this WSL machine varied between 0.03 and 0.83 cores from step to step, which swamps any difference. Both designs block in `read()`/`pause()`/`poll()` while idle, so zero is expected.
 
 ### Startup and teardown
 
 | N | agentbox: create all | Podman: create all | agentbox: create p95 | Podman: create p95 | agentbox: teardown | Podman: teardown |
 |---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.13 s | 1.36 s | 95 ms | 1,335 ms | 0.05 s | 1.67 s |
-| 50 | 0.67 s | 4.34 s | 151 ms | 1,589 ms | 0.19 s | 5.83 s |
-| 100 | 1.24 s | 8.82 s | 268 ms | 1,727 ms | 0.34 s | 10.99 s |
-| 250 | 4.15 s | 19.50 s | 448 ms | 1,549 ms | 0.68 s | 26.66 s |
-| 500 | 10.84 s | 42.18 s | 579 ms | 1,690 ms | 1.46 s | 54.74 s |
+| 10 | 0.09 s | 1.35 s | 78 ms | 1,345 ms | 0.05 s | 1.82 s |
+| 50 | 0.36 s | 4.58 s | 129 ms | 1,657 ms | 0.19 s | 6.09 s |
+| 100 | 0.66 s | 8.45 s | 149 ms | 1,628 ms | 0.29 s | 11.26 s |
+| 250 | 1.56 s | 20.02 s | 173 ms | 1,585 ms | 0.72 s | 27.40 s |
+| 500 | 3.20 s | 42.34 s | 175 ms | 1,699 ms | 1.49 s | 56.39 s |
 
 How it scales:
-- **agentbox creation time grows a little faster than linear.** Per sandbox it goes from 13 ms at N=10 to 22 ms at N=500. Its slowest creates (p95) go from 95 to 579 ms as the 16 workers contend.
-- **Podman is about 1.5 s per container, flat.** Most of that is the cost of starting the `podman` command itself.
+- **agentbox creation is now close to linear,** at 6–9 ms of wall time per sandbox. Its slowest creates (p95) level off at about 175 ms. Before the fix it took 10.8 s to create 500, with a p95 of 579 ms; committing ~4 MB per sandbox up front had been slowing startup too.
+- **Podman is about 1.6 s per container, flat.** Most of that is the cost of starting the `podman` command itself.
 
 ### Under load (all N run the command at once)
 
 | N | agentbox: batch wall time | Podman: batch wall time | agentbox: cmd p95 | Podman: cmd p95 | agentbox: CPU | Podman: CPU |
 |---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.07 s | 1.08 s | 61 ms | 1,071 ms | 0.7 CPU-s | 4.3 CPU-s |
-| 50 | 0.37 s | 3.07 s | 279 ms | 2,930 ms | 5.2 CPU-s | 22.9 CPU-s |
-| 100 | 0.70 s | 5.98 s | 493 ms | 5,420 ms | 11.4 CPU-s | 50.9 CPU-s |
-| 250 | 1.42 s | 14.22 s | 919 ms | 13,188 ms | 25.7 CPU-s | 165.6 CPU-s |
-| 500 | 2.86 s | 31.32 s | 1,861 ms | 28,905 ms | 54.8 CPU-s | 420.7 CPU-s |
+| 10 | 0.07 s | 1.03 s | 63 ms | 1,017 ms | 0.6 CPU-s | 4.5 CPU-s |
+| 50 | 0.39 s | 3.34 s | 317 ms | 3,084 ms | 5.7 CPU-s | 25.0 CPU-s |
+| 100 | 0.70 s | 5.93 s | 477 ms | 5,375 ms | 11.9 CPU-s | 51.7 CPU-s |
+| 250 | 1.45 s | 14.92 s | 926 ms | 13,694 ms | 26.3 CPU-s | 170.8 CPU-s |
+| 500 | 2.89 s | 32.47 s | 2,175 ms | 29,687 ms | 54.2 CPU-s | 434.5 CPU-s |
 
 What this shows:
 - **Both scale roughly linearly in total work.** The rising p95 is 500 commands queuing for 22 cores.
-- **agentbox spends about 0.11 CPU-s per command; Podman about 0.84 CPU-s.** Nearly all of Podman's gap is `podman exec` overhead (starting the CLI, then `conmon`, then `crun exec`), not the command itself.
+- **agentbox spends about 0.11 CPU-s per command; Podman about 0.87 CPU-s.** Nearly all of Podman's gap is `podman exec` overhead (starting the CLI, then `conmon`, then `crun exec`), not the command itself.
 - **An agent harness that keeps one long-lived shell open inside each container would close much of that gap.** That setup was not measured.
 
-## Where agentbox's memory goes
+## Before the fix
 
-The breakdown of one idle supervisor's memory (`/proc/<pid>/smaps`, by mapping):
+The first run (`4e99ce8`, [raw data](concurrency-results-before-fix.json)) measured agentbox at **4.6 MB per idle sandbox at N=500, against Podman's 2.3 MB**. Podman was the lighter of the two then.
 
-| Mapping | PSS |
-|---|---:|
-| `[stack]` | 2,162 kB |
-| libc | 46 kB |
-| `agentbox-exec` binary | 32 kB |
-| anon + heap | 28 kB |
+**Where that memory went:**
+- **Sandbox processes: 3.3 MB per sandbox (PSS).** 2.2 MB of the supervisor's was `[stack]`, and the anchor held another ~1 MB.
+- **Driver: 1.05 MB per sandbox.** This is the Python-side `AgentboxBox`.
 
-**Two fixed-size stack buffers in `src/c/agentbox_core.c` account for the stack:**
-- **`supervisor_state_t st`** in `agentbox_supervisor_main()`, about 1.1 MB. Its `checkpoints[AGENTBOX_MAX_CHECKPOINTS]` array is 256 × ~4.3 KB, and it is `memset` to zero.
-- **`char stack[AGENTBOX_PATH_LEN * AGENTBOX_MAX_CHECKPOINTS]`** in `remount_current()`, 1 MB.
+**The three causes, all fixed-size buffers sized for `AGENTBOX_MAX_CHECKPOINTS` (256):**
 
-**Why mostly empty buffers still use memory:** Ubuntu's gcc enables `-fstack-clash-protection` by default, which touches every page of a large stack frame. So both buffers are fully committed even though they are almost entirely empty.
+| Buffer | Size | Why it was committed even when unused |
+|---|---:|---|
+| `supervisor_state_t` on the supervisor's stack, `memset` to zero | ~1.1 MB | The `memset` writes every page. The anchor is created by `fork()` after Ubuntu's default `-fstack-clash-protection` has touched the frame, so it keeps its own ~1 MB copy. |
+| `remount_current()`'s `char stack[4096 * 256]` | 1 MB | Stack-clash probing touches every page of a frame this large. |
+| `agentbox_t.checkpoints[256]`, a client-side mirror of the checkpoint list | ~1.05 MB per Python `Sandbox` | ctypes zero-fills the struct. Nothing read the mirror, and it went wrong after `rollback(NULL)`. |
 
-**The anchor process holds a second copy.** It is created by `fork()` after the frame has been touched, so it keeps its own ~1 MB copy. That brings the total to 3.3 MB per sandbox.
+**The fix (`560874d`):**
+- `supervisor_state_t` is now `calloc`'d, so its pages commit only as checkpoints are written.
+- The lowerdir string is heap-allocated at its exact size.
+- The client mirror is removed.
 
-**The client side has the same fixed table.** `agentbox_t`, mirrored as `AgentboxBox` in `_core.py`, embeds the same 256-entry checkpoint table, so each Python `Sandbox` holds 1.05 MB in the driver.
+**Result:** supervisor + anchor PSS went from 3.3 MB to about 0.2 MB, and `sizeof(AgentboxBox)` from 1,112,088 to 12,300 bytes. `tests/test_sandbox_unit.py::test_idle_sandbox_memory_stays_small` guards against regressions.
 
-**Not yet verified:** sizing these by actual use (a growable checkpoint list, heap-allocated buffers, and forking the anchor before the big frame exists) should bring agentbox to roughly 0.2–0.3 MB of process memory per sandbox. That is below Podman's. This needs a fix and a re-run to confirm.
+**Side effect:** startup also got faster. Creating 500 sandboxes went from 10.8 s to 3.2 s, and the p95 create time from 579 ms to 175 ms. Load and teardown times did not change.
 
 ## Caveats
 
