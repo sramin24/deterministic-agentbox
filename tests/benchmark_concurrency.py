@@ -364,6 +364,26 @@ def run_parallel(fn, items, workers: int, deadline: float, min_free_mb: float, p
     return results, durations
 
 
+def wait_for_quiet(args) -> dict:
+    """Waits until background CPU drops to --quiet-cpu cores or below.
+
+    After a large teardown, a daemon (dockerd) can keep most cores busy for
+    a while; without this wait, that work would be charged to whatever step
+    runs next. Returns how long the wait took and the CPU burned meanwhile,
+    which is reported as part of the step that caused it."""
+    t0, cpu_s = time.monotonic(), 0.0
+    while True:
+        busy0 = cpu_busy_jiffies()
+        time.sleep(IDLE_CPU_WINDOW_SEC)
+        burned = jiffies_to_sec(cpu_busy_jiffies() - busy0)
+        cpu_s += burned
+        cores = burned / IDLE_CPU_WINDOW_SEC
+        waited = time.monotonic() - t0
+        if cores <= args.quiet_cpu or waited > args.quiet_timeout:
+            return {"wait_s": waited, "cpu_s": cpu_s, "final_cores": cores,
+                    "reached": cores <= args.quiet_cpu}
+
+
 def run_step(system, n: int, args) -> dict:
     step = {"system": system.name, "n": n, "ok": True, "failure": None}
     handles = []
@@ -449,6 +469,7 @@ def run_step(system, n: int, args) -> dict:
         if step["leftovers_after_teardown"] and step["ok"]:
             step["ok"] = False
             step["failure"] = f"teardown: {step['leftovers_after_teardown']} sandbox(es) still alive"
+        step["settle_after_teardown"] = wait_for_quiet(args)
     return step
 
 
@@ -480,6 +501,8 @@ def summarize(steps: list[dict]) -> list[dict]:
             "create_p50_ms": lambda s: s["create_p50_ms"],
             "create_p95_ms": lambda s: s["create_p95_ms"],
             "teardown_total_s": lambda s: s["teardown_total_s"],
+            "settle_wait_s": lambda s: s["settle_after_teardown"]["wait_s"],
+            "settle_cpu_s": lambda s: s["settle_after_teardown"]["cpu_s"],
             "load_wall_s": lambda s: statistics.median(r["wall_s"] for r in s["load_runs"]),
             "load_cmd_p50_ms": lambda s: statistics.median(r["cmd_p50_ms"] for r in s["load_runs"]),
             "load_cmd_p95_ms": lambda s: statistics.median(r["cmd_p95_ms"] for r in s["load_runs"]),
@@ -569,6 +592,9 @@ def main() -> None:
     parser.add_argument("--load-runs", type=int, default=3)
     parser.add_argument("--min-free-mb", type=float, default=1536)
     parser.add_argument("--phase-timeout", type=float, default=300)
+    parser.add_argument("--quiet-cpu", type=float, default=1.0,
+                        help="after each teardown, wait until background CPU is at most this many cores")
+    parser.add_argument("--quiet-timeout", type=float, default=600)
     parser.add_argument("--warmup", action="store_true",
                         help="run one discarded step at the largest N per system first, so a "
                              "daemon's (dockerd's) memory reaches its plateau before measuring")
@@ -592,6 +618,7 @@ def main() -> None:
     all_steps, warmups = [], []
     failed_at = {}  # system -> smallest n that failed; larger n are skipped
     try:
+        wait_for_quiet(args)
         for name in system_names:
             systems[name].prepare()
             if args.warmup:
