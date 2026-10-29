@@ -30,25 +30,18 @@ def test_create_and_close(workspace):
     sb.close()  # idempotent, must not raise or double-free
 
 
-def _tree_pss_kb(pid):
-    total, stack = 0, [pid]
-    while stack:
-        p = stack.pop()
-        with open(f"/proc/{p}/smaps_rollup") as f:
-            total += next(int(line.split()[1]) for line in f if line.startswith("Pss:"))
-        for tid in os.listdir(f"/proc/{p}/task"):
-            with open(f"/proc/{p}/task/{tid}/children") as f:
-                stack.extend(int(c) for c in f.read().split())
-    return total
-
-
 def test_idle_sandbox_memory_stays_small(workspace):
     # Regression guard for docs/benchmarks/concurrency.md: fixed-size
     # 256-checkpoint tables used to cost ~3.3 MB per supervisor (+ anchor)
     # and ~1 MB per client-side struct, whether or not checkpoints were used.
+    # Measured at ~0.2-0.3 MB after the fix; 1 MB leaves headroom for libc
+    # and kernel differences between machines.
+    from benchmark_concurrency import tree_pss_kb
+
     assert ctypes.sizeof(_core.AgentboxBox) < 64 * 1024
     with Sandbox(workspace) as sb:
-        assert _tree_pss_kb(sb._box.supervisor_pid) < 1024
+        pss, _procs = tree_pss_kb([sb._box.supervisor_pid])
+        assert pss < 1024
 
 
 def test_many_checkpoints_then_rollback_to_an_early_one(workspace):

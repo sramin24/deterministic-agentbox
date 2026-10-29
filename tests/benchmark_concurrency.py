@@ -149,6 +149,17 @@ class AgentboxSystem:
     def cleanup_leftovers(self) -> None:
         pass  # every Sandbox is closed by teardown; scratch dir is removed by main()
 
+    def count_leftovers(self) -> int:
+        count = 0
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                try:
+                    with open(f"/proc/{entry}/comm") as f:
+                        count += f.read().strip() == "agentbox-exec"
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    pass
+        return count
+
 
 class PodmanSystem:
     name = "podman"
@@ -191,6 +202,9 @@ class PodmanSystem:
         if ids:
             self._podman("stop", "-t", "0", *ids, timeout=600)
             self._podman("rm", *ids, timeout=600)
+
+    def count_leftovers(self) -> int:
+        return len(self._podman("ps", "-aq", "--filter", f"label={PODMAN_LABEL}").split())
 
 
 # ---- one step: N sandboxes of one system --------------------------------
@@ -293,7 +307,7 @@ def run_step(system, n: int, args) -> dict:
                 "cpu_s": jiffies_to_sec(cpu_busy_jiffies() - busy0),
             })
         step["load_runs"] = loads
-        step["mem_peak_used_mb"] = mem_before - mem_available_mb()
+        step["mem_used_after_load_mb"] = mem_before - mem_available_mb()
 
     except StepFailed as e:
         step["ok"] = False
@@ -305,6 +319,12 @@ def run_step(system, n: int, args) -> dict:
             list(pool.map(lambda h: _quiet(system.destroy, h), handles))
         step["teardown_total_s"] = time.perf_counter() - t0
         _quiet(system.cleanup_leftovers)
+        # Clean-state check: the next step's MemAvailable baseline is only
+        # meaningful if nothing from this one is still alive.
+        step["leftovers_after_teardown"] = system.count_leftovers()
+        if step["leftovers_after_teardown"] and step["ok"]:
+            step["ok"] = False
+            step["failure"] = f"teardown: {step['leftovers_after_teardown']} sandbox(es) still alive"
     return step
 
 
@@ -340,6 +360,8 @@ def summarize(steps: list[dict]) -> list[dict]:
             "load_cmd_p50_ms": lambda s: statistics.median(r["cmd_p50_ms"] for r in s["load_runs"]),
             "load_cmd_p95_ms": lambda s: statistics.median(r["cmd_p95_ms"] for r in s["load_runs"]),
             "load_cpu_s": lambda s: statistics.median(r["cpu_s"] for r in s["load_runs"]),
+            "load_cpu_per_cmd_ms": lambda s: statistics.median(r["cpu_s"] for r in s["load_runs"]) / s["n"] * 1000,
+            "mem_used_after_load_mb": lambda s: s["mem_used_after_load_mb"],
         }
         for name, get in metrics.items():
             vals = [get(s) for s in ok]
@@ -347,6 +369,28 @@ def summarize(steps: list[dict]) -> list[dict]:
                 row[name] = {"median": statistics.median(vals), "min": min(vals), "max": max(vals)}
         rows.append(row)
     return rows
+
+
+# The soft "starts to degrade" point: the first N at which a per-sandbox
+# cost has more than doubled from its value at the smallest N. PSS stands in
+# for memory because MemAvailable is noise at small N; command p95 is
+# included even though it mostly measures queueing for CPU cores.
+DEGRADE_METRICS = ("pss_per_sandbox_mb", "load_cpu_per_cmd_ms", "load_cmd_p95_ms")
+
+
+def degrade_points(rows: list[dict]) -> dict:
+    points = {}
+    for system in sorted({r["system"] for r in rows}):
+        ok_rows = sorted((r for r in rows if r["system"] == system and r["reps_ok"]), key=lambda r: r["n"])
+        points[system] = {}
+        for metric in DEGRADE_METRICS:
+            usable = [r for r in ok_rows if metric in r]
+            if not usable:
+                continue
+            base = usable[0][metric]["median"]
+            first = next((r["n"] for r in usable[1:] if r[metric]["median"] > 2 * base), None)
+            points[system][metric] = {"baseline_n": usable[0]["n"], "baseline": base, "first_n_over_2x": first}
+    return points
 
 
 def print_table(rows: list[dict]) -> None:
@@ -438,9 +482,15 @@ def main() -> None:
 
     rows = summarize(all_steps)
     print_table(rows)
+    degrades = degrade_points(rows)
+    print("\nfirst N where a per-sandbox cost exceeds 2x its smallest-N value:")
+    for system, metrics in degrades.items():
+        for metric, p in metrics.items():
+            print(f"  {system:9} {metric:22} {p['first_n_over_2x'] or 'never'}")
     if args.out:
         with open(args.out, "w") as f:
-            json.dump({"machine": info, "args": vars(args), "summary": rows, "steps": all_steps}, f, indent=2)
+            json.dump({"machine": info, "args": vars(args), "summary": rows,
+                       "degrade_points": degrades, "steps": all_steps}, f, indent=2)
         print(f"\nwrote {args.out}")
 
 

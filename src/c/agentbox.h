@@ -40,7 +40,7 @@ typedef enum {
     AGENTBOX_ERR_INVALID_ARGUMENT = 8,
     AGENTBOX_ERR_FILESYSTEM_MISMATCH = 9,     /* workspace_dir/runtime_dir not on the same st_dev */
     AGENTBOX_ERR_PERMISSION_DENIED = 10,
-    AGENTBOX_ERR_CHECKPOINT_LIMIT_REACHED = 11 /* checkpoint_count == AGENTBOX_MAX_CHECKPOINTS */
+    AGENTBOX_ERR_CHECKPOINT_LIMIT_REACHED = 11 /* supervisor already holds AGENTBOX_MAX_CHECKPOINTS checkpoints */
 } agentbox_errcode_t;
 
 /*
