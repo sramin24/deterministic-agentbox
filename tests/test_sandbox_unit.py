@@ -6,6 +6,7 @@ of the test IS a failure path that would otherwise require deliberately
 breaking the shared dev environment's AppArmor setup -- there, a
 monkeypatched C call stands in.
 """
+import ctypes
 import os
 
 import pytest
@@ -27,6 +28,40 @@ def test_create_and_close(workspace):
     sb.close()
     assert sb._box.active == 0
     sb.close()  # idempotent, must not raise or double-free
+
+
+def _tree_pss_kb(pid):
+    total, stack = 0, [pid]
+    while stack:
+        p = stack.pop()
+        with open(f"/proc/{p}/smaps_rollup") as f:
+            total += next(int(line.split()[1]) for line in f if line.startswith("Pss:"))
+        for tid in os.listdir(f"/proc/{p}/task"):
+            with open(f"/proc/{p}/task/{tid}/children") as f:
+                stack.extend(int(c) for c in f.read().split())
+    return total
+
+
+def test_idle_sandbox_memory_stays_small(workspace):
+    # Regression guard for docs/benchmarks/concurrency.md: fixed-size
+    # 256-checkpoint tables used to cost ~3.3 MB per supervisor (+ anchor)
+    # and ~1 MB per client-side struct, whether or not checkpoints were used.
+    assert ctypes.sizeof(_core.AgentboxBox) < 64 * 1024
+    with Sandbox(workspace) as sb:
+        assert _tree_pss_kb(sb._box.supervisor_pid) < 1024
+
+
+def test_many_checkpoints_then_rollback_to_an_early_one(workspace):
+    with Sandbox(workspace) as sb:
+        ids = []
+        for i in range(20):
+            sb.run(f"echo -n v{i} > file.txt")
+            ids.append(sb.checkpoint(f"step {i}"))
+        sb.rollback(ids[4])
+        assert sb.run("cat file.txt").stdout == "v4"
+        sb.run("echo -n after > file.txt")
+        sb.rollback()  # most recent remaining checkpoint is still ids[4]
+        assert sb.run("cat file.txt").stdout == "v4"
 
 
 def test_context_manager_closes_and_never_commits_implicitly(workspace):
