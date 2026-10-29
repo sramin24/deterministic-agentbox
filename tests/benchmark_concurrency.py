@@ -1,5 +1,5 @@
 """Benchmark: many concurrent agentbox Sandboxes on one machine, against the
-same number of rootless Podman containers.
+same number of rootless Podman (or Docker) containers.
 
 For each scale step (default 10, 50, 100, 250, 500) and each system, it
 creates N sandboxes over ONE shared fixture workspace, measures what they
@@ -13,11 +13,19 @@ fixture, which is exactly what agentbox gives each Sandbox. `--network host`
 matches agentbox (which shares the host network) and spares Podman a
 slirp4netns process per container -- i.e. it is the lighter Podman setup.
 
-Memory is measured two ways, the same way for both systems:
+Docker (`--systems docker`) has no `:O` overlay volume, so the fixture is
+baked into an image and each container's own writable layer gives the same
+copy-on-write view. Measured against Docker Desktop's WSL2 backend: dockerd
+runs in another WSL distro on the same kernel, so MemAvailable sees its
+containers, while their processes are read through a `--pid=host` helper
+container. dockerd + containerd are reported separately as engine memory.
+
+Memory is measured two ways, the same way for every system:
   - system-wide MemAvailable drop (/proc/meminfo) -- the headline number,
     since it includes kernel-side cost (mounts, namespaces, dentries);
   - summed PSS (/proc/<pid>/smaps_rollup) of each sandbox's own processes:
-    agentbox-exec supervisor + anchor, or conmon + the container process.
+    agentbox-exec supervisor + anchor, conmon + the container process
+    (Podman), or containerd-shim + the container process (Docker).
 `podman stats` is deliberately not used: on rootless setups without cgroup
 delegation (e.g. WSL) it reports a shared cgroup, not the container.
 
@@ -43,7 +51,8 @@ from agentbox import Sandbox
 from benchmark_latency import FILE_COUNT, build_fixture
 
 PODMAN_IMAGE = "docker.io/library/alpine:3.20"
-PODMAN_LABEL = "agentbox-bench=1"  # only containers with this label are ever removed
+DOCKER_IMAGE = "agentbox-bench-fixture:latest"
+BENCH_LABEL = "agentbox-bench=1"  # only containers with this label are ever removed
 LOAD_CMD = (
     "for i in $(seq 200); do echo $i > out_$i.txt; done; "
     "find . -type f | xargs cat | md5sum"
@@ -119,8 +128,9 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[k]
 
 
-# ---- the two systems, behind one tiny interface -------------------------
-# create(i) -> handle; root_pids(handle) -> pids to sum PSS over;
+# ---- the systems, behind one tiny interface ------------------------------
+# prepare(); create(i) -> handle; process_pss(handles) -> (kB, process count);
+# engine_pss_mb() -> shared daemon memory, or None if there is no daemon;
 # run(handle) -> (exit_code, stdout); destroy(handle)
 
 class AgentboxSystem:
@@ -136,8 +146,14 @@ class AgentboxSystem:
         # process would otherwise share (and clobber) one runtime_dir.
         return Sandbox(self.fixture, runtime_dir=os.path.join(self.scratch, f"rt_{i}"))
 
-    def root_pids(self, sb: Sandbox) -> list[int]:
-        return [sb._box.supervisor_pid]
+    def prepare(self) -> None:
+        pass
+
+    def process_pss(self, sandboxes: list[Sandbox]) -> tuple[int, int]:
+        return tree_pss_kb([sb._box.supervisor_pid for sb in sandboxes])
+
+    def engine_pss_mb(self) -> float | None:
+        return None
 
     def run(self, sb: Sandbox) -> tuple[int, str]:
         result = sb.run(LOAD_CMD, timeout_sec=120)
@@ -173,16 +189,23 @@ class PodmanSystem:
             raise RuntimeError(f"podman {args[0]} failed: {proc.stderr.strip()[-500:]}")
         return proc.stdout.strip()
 
+    def prepare(self) -> None:
+        self._podman("pull", "-q", PODMAN_IMAGE, timeout=600)
+        self.cleanup_leftovers()
+
     def create(self, i: int) -> tuple[str, int]:
         cid = self._podman(
-            "run", "-d", "--label", PODMAN_LABEL, "--network", "host",
+            "run", "-d", "--label", BENCH_LABEL, "--network", "host",
             "-v", f"{self.fixture}:/ws:O", PODMAN_IMAGE, "sleep", "infinity",
         )
         conmon_pid = int(self._podman("inspect", "--format", "{{.State.ConmonPid}}", cid))
         return cid, conmon_pid
 
-    def root_pids(self, handle: tuple[str, int]) -> list[int]:
-        return [handle[1]]
+    def process_pss(self, handles: list[tuple[str, int]]) -> tuple[int, int]:
+        return tree_pss_kb([conmon_pid for _cid, conmon_pid in handles])
+
+    def engine_pss_mb(self) -> float | None:
+        return None  # daemonless
 
     def run(self, handle: tuple[str, int]) -> tuple[int, str]:
         proc = subprocess.run(
@@ -198,13 +221,108 @@ class PodmanSystem:
         self._podman("rm", handle[0])
 
     def cleanup_leftovers(self) -> None:
-        ids = self._podman("ps", "-aq", "--filter", f"label={PODMAN_LABEL}").split()
+        ids = self._podman("ps", "-aq", "--filter", f"label={BENCH_LABEL}").split()
         if ids:
             self._podman("stop", "-t", "0", *ids, timeout=600)
             self._podman("rm", *ids, timeout=600)
 
     def count_leftovers(self) -> int:
-        return len(self._podman("ps", "-aq", "--filter", f"label={PODMAN_LABEL}").split())
+        return len(self._podman("ps", "-aq", "--filter", f"label={BENCH_LABEL}").split())
+
+
+# Run inside a `--pid=host` helper container, i.e. in Docker's own pid
+# namespace, where these pids live. Each container is its init process plus
+# its parent containerd-shim; a shim is counted once even if shared.
+_DOCKER_PSS_SCRIPT = r"""
+total=0; n=0; seen=" "
+for p in "$@"; do
+  shim=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+  for q in $shim $p; do
+    case "$seen" in *" $q "*) continue ;; esac
+    seen="$seen$q "
+    k=$(awk '/^Pss:/{print $2}' /proc/$q/smaps_rollup 2>/dev/null)
+    if [ -n "$k" ]; then total=$((total + k)); n=$((n + 1)); fi
+  done
+done
+echo $total $n
+"""
+
+_DOCKER_ENGINE_SCRIPT = r"""
+t=0
+for d in /proc/[0-9]*; do
+  case "$(cat $d/comm 2>/dev/null)" in
+    dockerd|containerd) k=$(awk '/^Pss:/{print $2}' $d/smaps_rollup 2>/dev/null); t=$((t + ${k:-0})) ;;
+  esac
+done
+echo $t
+"""
+
+
+class DockerSystem:
+    name = "docker"
+
+    def __init__(self, fixture: str, scratch: str):
+        self.fixture = fixture
+        self.scratch = scratch
+
+    def _docker(self, *args: str, timeout: int = 120) -> str:
+        proc = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"docker {args[0]} failed: {proc.stderr.strip()[-500:]}")
+        return proc.stdout.strip()
+
+    # SYS_PTRACE: smaps_rollup of another container's (or dockerd's)
+    # processes is ptrace-gated; without it every PSS read is EACCES.
+    def _helper(self, script: str, *script_args: str) -> str:
+        return self._docker(
+            "run", "--rm", "--pid=host", "--cap-add", "SYS_PTRACE", "--label", BENCH_LABEL, PODMAN_IMAGE,
+            "sh", "-c", script, "sh", *script_args, timeout=300,
+        )
+
+    def prepare(self) -> None:
+        # Docker has no equivalent of Podman's `:O` overlay volume, so the
+        # fixture is baked into an image instead: each container's own
+        # writable layer is then a copy-on-write view over it -- the same
+        # isolation the agentbox and Podman setups give.
+        ctx = os.path.join(self.scratch, "docker_ctx")
+        shutil.copytree(self.fixture, os.path.join(ctx, "fixture"))
+        with open(os.path.join(ctx, "Dockerfile"), "w") as f:
+            f.write(f"FROM {PODMAN_IMAGE}\nCOPY fixture /ws\n")
+        self._docker("build", "-q", "--label", BENCH_LABEL, "-t", DOCKER_IMAGE, ctx, timeout=600)
+        self.cleanup_leftovers()
+
+    def create(self, i: int) -> tuple[str, int]:
+        cid = self._docker(
+            "run", "-d", "--label", BENCH_LABEL, "--network", "host",
+            DOCKER_IMAGE, "sleep", "infinity",
+        )
+        init_pid = int(self._docker("inspect", "--format", "{{.State.Pid}}", cid))
+        return cid, init_pid
+
+    def process_pss(self, handles: list[tuple[str, int]]) -> tuple[int, int]:
+        kb, nprocs = self._helper(_DOCKER_PSS_SCRIPT, *(str(pid) for _cid, pid in handles)).split()
+        return int(kb), int(nprocs)
+
+    def engine_pss_mb(self) -> float | None:
+        return int(self._helper(_DOCKER_ENGINE_SCRIPT)) / 1024
+
+    def run(self, handle: tuple[str, int]) -> tuple[int, str]:
+        proc = subprocess.run(
+            ["docker", "exec", "-w", "/ws", handle[0], "sh", "-c", LOAD_CMD],
+            capture_output=True, text=True, timeout=120,
+        )
+        return proc.returncode, proc.stdout
+
+    def destroy(self, handle: tuple[str, int]) -> None:
+        self._docker("rm", "-f", handle[0])  # SIGKILL, no stop timeout
+
+    def cleanup_leftovers(self) -> None:
+        ids = self._docker("ps", "-aq", "--filter", f"label={BENCH_LABEL}").split()
+        if ids:
+            self._docker("rm", "-f", *ids, timeout=600)
+
+    def count_leftovers(self) -> int:
+        return len(self._docker("ps", "-aq", "--filter", f"label={BENCH_LABEL}").split())
 
 
 # ---- one step: N sandboxes of one system --------------------------------
@@ -255,6 +373,7 @@ def run_step(system, n: int, args) -> dict:
     time.sleep(IDLE_CPU_WINDOW_SEC)
     step["baseline_cpu_cores"] = jiffies_to_sec(cpu_busy_jiffies() - busy0) / IDLE_CPU_WINDOW_SEC
     driver_pss_before = pss_kb(os.getpid())
+    engine_before = system.engine_pss_mb()
     mem_before = mem_available_mb()
     try:
         # --- create
@@ -275,11 +394,16 @@ def run_step(system, n: int, args) -> dict:
         time.sleep(SETTLE_SEC)
         step["mem_used_mb"] = mem_before - mem_available_mb()
         step["mem_per_sandbox_mb"] = step["mem_used_mb"] / n
-        pss, nprocs = tree_pss_kb([p for h in handles for p in system.root_pids(h)])
+        pss, nprocs = system.process_pss(handles)
         step["pss_total_mb"] = pss / 1024
         step["pss_per_sandbox_mb"] = pss / 1024 / n
         step["procs_per_sandbox"] = nprocs / n
         step["driver_pss_delta_mb"] = (pss_kb(os.getpid()) - driver_pss_before) / 1024
+        # Shared daemon memory (Docker only): its total, and how much it grew
+        # while these N sandboxes were created.
+        engine_after = system.engine_pss_mb()
+        step["engine_pss_mb"] = engine_after
+        step["engine_growth_mb"] = None if engine_after is None else engine_after - engine_before
         busy0 = cpu_busy_jiffies()
         time.sleep(IDLE_CPU_WINDOW_SEC)
         idle = jiffies_to_sec(cpu_busy_jiffies() - busy0) / IDLE_CPU_WINDOW_SEC
@@ -362,9 +486,11 @@ def summarize(steps: list[dict]) -> list[dict]:
             "load_cpu_s": lambda s: statistics.median(r["cpu_s"] for r in s["load_runs"]),
             "load_cpu_per_cmd_ms": lambda s: statistics.median(r["cpu_s"] for r in s["load_runs"]) / s["n"] * 1000,
             "mem_used_after_load_mb": lambda s: s["mem_used_after_load_mb"],
+            "engine_pss_mb": lambda s: s.get("engine_pss_mb"),
+            "engine_growth_mb": lambda s: s.get("engine_growth_mb"),
         }
         for name, get in metrics.items():
-            vals = [get(s) for s in ok]
+            vals = [v for v in (get(s) for s in ok) if v is not None]
             if vals:
                 row[name] = {"median": statistics.median(vals), "min": min(vals), "max": max(vals)}
         rows.append(row)
@@ -418,13 +544,18 @@ def print_table(rows: list[dict]) -> None:
 def machine_info() -> dict:
     with open("/proc/meminfo") as f:
         mem_total = int(f.readline().split()[1]) / 1024 / 1024
-    podman = subprocess.run(["podman", "--version"], capture_output=True, text=True).stdout.strip()
+    def version(*cmd: str) -> str | None:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or None
+        except FileNotFoundError:
+            return None
     return {
         "kernel": platform.release(),
         "cpus": os.cpu_count(),
         "mem_total_gb": round(mem_total, 1),
         "python": platform.python_version(),
-        "podman": podman or None,
+        "podman": version("podman", "--version"),
+        "docker": version("docker", "version", "--format", "{{.Server.Version}} ({{.Server.Os}})"),
         "fixture_files": FILE_COUNT,
     }
 
@@ -438,6 +569,9 @@ def main() -> None:
     parser.add_argument("--load-runs", type=int, default=3)
     parser.add_argument("--min-free-mb", type=float, default=1536)
     parser.add_argument("--phase-timeout", type=float, default=300)
+    parser.add_argument("--warmup", action="store_true",
+                        help="run one discarded step at the largest N per system first, so a "
+                             "daemon's (dockerd's) memory reaches its plateau before measuring")
     parser.add_argument("--out", help="write raw steps + summary as JSON here")
     args = parser.parse_args()
 
@@ -450,16 +584,21 @@ def main() -> None:
     systems = {
         "agentbox": AgentboxSystem(fixture, base),
         "podman": PodmanSystem(fixture, base),
+        "docker": DockerSystem(fixture, base),
     }
-    if "podman" in system_names:
-        subprocess.run(["podman", "pull", "-q", PODMAN_IMAGE], check=True, capture_output=True)
-        systems["podman"].cleanup_leftovers()
 
     info = machine_info()
     print(f"machine: {info}")
-    all_steps = []
+    all_steps, warmups = [], []
     failed_at = {}  # system -> smallest n that failed; larger n are skipped
     try:
+        for name in system_names:
+            systems[name].prepare()
+            if args.warmup:
+                print(f"warm-up  {name:8} N={max(steps_n):<4} (discarded) ...", end=" ", flush=True)
+                step = run_step(systems[name], max(steps_n), args)
+                warmups.append(step)
+                print("ok" if step["ok"] else f"FAILED: {step['failure']}")
         for rep in range(args.reps):
             # Alternate which system goes first, so slow drift hits both equally.
             order = system_names if rep % 2 == 0 else list(reversed(system_names))
@@ -490,7 +629,7 @@ def main() -> None:
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"machine": info, "args": vars(args), "summary": rows,
-                       "degrade_points": degrades, "steps": all_steps}, f, indent=2)
+                       "degrade_points": degrades, "steps": all_steps, "warmups": warmups}, f, indent=2)
         print(f"\nwrote {args.out}")
 
 
