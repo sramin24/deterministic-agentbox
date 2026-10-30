@@ -468,6 +468,9 @@ agentbox_errcode_t agentbox_create(agentbox_t *box, const char *workspace_dir, c
     char runtime_dir[AGENTBOX_PATH_LEN];
     if (runtime_dir_in && runtime_dir_in[0]) {
         snprintf(runtime_dir, sizeof(runtime_dir), "%s", runtime_dir_in);
+        if (mkdir(runtime_dir, 0700) != 0 && errno != EEXIST) {
+            return AGENTBOX_ERR_IO;
+        }
     } else {
         /* Sibling of workspace_dir, per Part 0.5 -- must share a
          * filesystem with it, and /tmp very often does not. */
@@ -477,11 +480,17 @@ agentbox_errcode_t agentbox_create(agentbox_t *box, const char *workspace_dir, c
         snprintf(base_copy, sizeof(base_copy), "%s", workspace_dir);
         char *parent = dirname(ws_copy);
         char *base = basename(base_copy);
-        snprintf(runtime_dir, sizeof(runtime_dir), "%s/.agentbox_rt_%s_%d", parent, base, (int)getpid());
-    }
-
-    if (mkdir(runtime_dir, 0700) != 0 && errno != EEXIST) {
-        return AGENTBOX_ERR_IO;
+        /* mkdtemp's random suffix keeps several Sandboxes over the same
+         * workspace in one process from sharing (and purging) one
+         * runtime_dir -- the pid alone is not unique enough (issue #1). */
+        int n = snprintf(runtime_dir, sizeof(runtime_dir), "%s/.agentbox_rt_%s_%d_XXXXXX",
+                         parent, base, (int)getpid());
+        if (n < 0 || (size_t)n >= sizeof(runtime_dir)) {
+            return AGENTBOX_ERR_INVALID_ARGUMENT;
+        }
+        if (!mkdtemp(runtime_dir)) {
+            return AGENTBOX_ERR_IO;
+        }
     }
     struct stat rt_st;
     if (stat(runtime_dir, &rt_st) != 0) {
