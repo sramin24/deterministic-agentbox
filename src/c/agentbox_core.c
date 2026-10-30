@@ -158,10 +158,19 @@ static void build_lower_stack(const supervisor_state_t *st, char *out, size_t ou
     snprintf(out + off, out_len - off, "%s", st->workspace_dir);
 }
 
+/* The lowerdir string is heap-allocated at its exact size, not a worst-case
+ * AGENTBOX_PATH_LEN * AGENTBOX_MAX_CHECKPOINTS (1 MB) stack array: with
+ * -fstack-clash-protection (on by default in Ubuntu's gcc) every page of a
+ * frame that large gets touched, committing 1 MB per supervisor. */
 static agentbox_errcode_t remount_current(supervisor_state_t *st) {
-    char stack[AGENTBOX_PATH_LEN * AGENTBOX_MAX_CHECKPOINTS];
-    build_lower_stack(st, stack, sizeof(stack));
-    return agentbox_cow_mount(stack, st->live_upper, st->live_work, st->merged_dir);
+    size_t len = strlen(st->workspace_dir) + 1;
+    for (int i = 0; i < st->checkpoint_count; i++) len += strlen(st->checkpoints[i].layer_dir) + 1;
+    char *stack = malloc(len);
+    if (!stack) return AGENTBOX_ERR_GENERIC;
+    build_lower_stack(st, stack, len);
+    agentbox_errcode_t rc = agentbox_cow_mount(stack, st->live_upper, st->live_work, st->merged_dir);
+    free(stack);
+    return rc;
 }
 
 static agentbox_errcode_t handle_checkpoint(supervisor_state_t *st, const char *tag, char *out_id, size_t out_id_len) {
@@ -299,19 +308,29 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
         for (;;) pause();
     }
 
-    supervisor_state_t st;
-    memset(&st, 0, sizeof(st));
-    snprintf(st.workspace_dir, sizeof(st.workspace_dir), "%s", workspace_dir);
-    snprintf(st.runtime_dir, sizeof(st.runtime_dir), "%s", runtime_dir);
-    snprintf(st.merged_dir, sizeof(st.merged_dir), "%s/merged", runtime_dir);
-    mkdir(st.merged_dir, 0700);
-    new_generation_dirs(&st);
+    /* calloc, not a stack variable + memset: the checkpoint table is
+     * ~1.1 MB, and calloc'd pages stay uncommitted until a checkpoint is
+     * actually written, where memset (or stack-clash probing of a frame
+     * this size) would commit all of it up front. */
+    supervisor_state_t *st = calloc(1, sizeof(*st));
+    if (!st) {
+        send_err(ctrl_fd, AGENTBOX_ERR_GENERIC, "supervisor state allocation failed");
+        kill(anchor_pid, SIGKILL);
+        waitpid(anchor_pid, NULL, 0);
+        return 1;
+    }
+    snprintf(st->workspace_dir, sizeof(st->workspace_dir), "%s", workspace_dir);
+    snprintf(st->runtime_dir, sizeof(st->runtime_dir), "%s", runtime_dir);
+    snprintf(st->merged_dir, sizeof(st->merged_dir), "%s/merged", runtime_dir);
+    mkdir(st->merged_dir, 0700);
+    new_generation_dirs(st);
 
-    agentbox_errcode_t mount_rc = remount_current(&st);
+    agentbox_errcode_t mount_rc = remount_current(st);
     if (mount_rc != AGENTBOX_OK) {
         send_err(ctrl_fd, mount_rc, "initial overlay mount failed");
         kill(anchor_pid, SIGKILL);
         waitpid(anchor_pid, NULL, 0);
+        free(st);
         return 1;
     }
 
@@ -329,25 +348,25 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
         if (strcmp(verb, "CHECKPOINT") == 0) {
             char *tag = next_field(&cursor);
             char id[AGENTBOX_ID_LEN];
-            agentbox_errcode_t rc = handle_checkpoint(&st, tag, id, sizeof(id));
+            agentbox_errcode_t rc = handle_checkpoint(st, tag, id, sizeof(id));
             if (rc == AGENTBOX_OK) send_ok(ctrl_fd, id);
             else send_err(ctrl_fd, rc, "checkpoint failed");
 
         } else if (strcmp(verb, "ROLLBACK") == 0) {
             char *id = next_field(&cursor);
-            agentbox_errcode_t rc = handle_rollback(&st, id);
+            agentbox_errcode_t rc = handle_rollback(st, id);
             if (rc == AGENTBOX_OK) send_ok(ctrl_fd, "");
             else send_err(ctrl_fd, rc, "rollback failed");
 
         } else if (strcmp(verb, "COMMIT") == 0) {
-            agentbox_errcode_t rc = handle_commit(&st);
+            agentbox_errcode_t rc = handle_commit(st);
             if (rc == AGENTBOX_OK) send_ok(ctrl_fd, "");
             else send_err(ctrl_fd, rc, "commit failed");
 
         } else if (strcmp(verb, "DIFF") == 0) {
             char **paths = NULL;
             size_t count = 0;
-            agentbox_errcode_t rc = handle_diff(&st, &paths, &count);
+            agentbox_errcode_t rc = handle_diff(st, &paths, &count);
             if (rc == AGENTBOX_OK) {
                 size_t bufcap = 64;
                 for (size_t i = 0; i < count; i++) bufcap += strlen(paths[i]) + 1;
@@ -368,11 +387,11 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
             char *cmd = cursor; /* rest of the buffer */
             int timeout_sec = atoi(timeout_str);
             char stdout_path[AGENTBOX_PATH_LEN], stderr_path[AGENTBOX_PATH_LEN];
-            snprintf(stdout_path, sizeof(stdout_path), "%s/run_%d_stdout.txt", st.runtime_dir, st.run_counter);
-            snprintf(stderr_path, sizeof(stderr_path), "%s/run_%d_stderr.txt", st.runtime_dir, st.run_counter);
-            st.run_counter++;
+            snprintf(stdout_path, sizeof(stdout_path), "%s/run_%d_stdout.txt", st->runtime_dir, st->run_counter);
+            snprintf(stderr_path, sizeof(stderr_path), "%s/run_%d_stderr.txt", st->runtime_dir, st->run_counter);
+            st->run_counter++;
             agentbox_exec_result_t result;
-            agentbox_errcode_t rc = agentbox_proc_run(st.merged_dir, cmd, timeout_sec, stdout_path, stderr_path,
+            agentbox_errcode_t rc = agentbox_proc_run(st->merged_dir, cmd, timeout_sec, stdout_path, stderr_path,
                                                        send_chunk_to_client, &ctrl_fd, &result);
             if (rc == AGENTBOX_OK) {
                 char buf[AGENTBOX_PATH_LEN * 2 + 128];
@@ -385,7 +404,7 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
             }
 
         } else if (strcmp(verb, "SHUTDOWN") == 0) {
-            handle_shutdown(&st);
+            handle_shutdown(st);
             send_ok(ctrl_fd, "");
             shutting_down = 1;
 
@@ -398,6 +417,7 @@ int agentbox_supervisor_main(int ctrl_fd, const char *workspace_dir, const char 
 
     kill(anchor_pid, SIGKILL);
     waitpid(anchor_pid, NULL, 0);
+    free(st);
     return 0;
 }
 
@@ -547,7 +567,6 @@ agentbox_errcode_t agentbox_create(agentbox_t *box, const char *workspace_dir, c
     box->supervisor_pid = pid;
     box->ctrl_fd = sv[0];
     box->active = 1;
-    box->checkpoint_count = 0;
     return AGENTBOX_OK;
 }
 
@@ -581,13 +600,6 @@ agentbox_errcode_t agentbox_checkpoint(agentbox_t *box, const char *tag, char *o
     if (strcmp(status, "OK") == 0) {
         char *id = next_field(&cursor);
         if (out_id) snprintf(out_id, out_id_len, "%s", id);
-        if (box->checkpoint_count < AGENTBOX_MAX_CHECKPOINTS) {
-            agentbox_checkpoint_t *c = &box->checkpoints[box->checkpoint_count++];
-            snprintf(c->id, sizeof(c->id), "%s", id);
-            snprintf(c->tag, sizeof(c->tag), "%s", tag ? tag : "");
-            c->layer_dir[0] = '\0';
-            c->created_at_ms = now_ms();
-        }
         rc = AGENTBOX_OK;
     } else {
         char *code_str = next_field(&cursor);
@@ -610,16 +622,6 @@ agentbox_errcode_t agentbox_rollback(agentbox_t *box, const char *checkpoint_id)
     char *status = next_field(&cursor);
     agentbox_errcode_t rc;
     if (strcmp(status, "OK") == 0) {
-        if (checkpoint_id == NULL || checkpoint_id[0] == '\0') {
-            if (box->checkpoint_count > 0) box->checkpoint_count--;
-        } else {
-            for (int i = 0; i < box->checkpoint_count; i++) {
-                if (strcmp(box->checkpoints[i].id, checkpoint_id) == 0) {
-                    box->checkpoint_count = i + 1;
-                    break;
-                }
-            }
-        }
         rc = AGENTBOX_OK;
     } else {
         char *code_str = next_field(&cursor);
@@ -638,7 +640,6 @@ agentbox_errcode_t agentbox_commit(agentbox_t *box) {
     char *status = next_field(&cursor);
     agentbox_errcode_t rc;
     if (strcmp(status, "OK") == 0) {
-        box->checkpoint_count = 0;
         rc = AGENTBOX_OK;
     } else {
         char *code_str = next_field(&cursor);
