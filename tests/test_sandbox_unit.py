@@ -29,6 +29,24 @@ def test_create_and_close(workspace):
     sb.close()  # idempotent, must not raise or double-free
 
 
+def test_two_sandboxes_on_one_workspace_stay_independent(workspace):
+    # Issue #1: the default runtime_dir used to be derived from the workspace
+    # name + pid only, so both of these shared one, and closing `a` purged
+    # `b`'s layers.
+    a = Sandbox(workspace)
+    b = Sandbox(workspace)
+    try:
+        assert a._box.runtime_dir != b._box.runtime_dir
+        a.run("echo -n from-a > file.txt")
+        b.run("echo -n from-b > file.txt")
+        assert a.run("cat file.txt").stdout == "from-a"
+        a.close()
+        assert b.run("cat file.txt").stdout == "from-b"
+    finally:
+        a.close()
+        b.close()
+
+
 def test_context_manager_closes_and_never_commits_implicitly(workspace):
     with Sandbox(workspace) as sb:
         result = sb.run("echo -n hi > out.txt")
