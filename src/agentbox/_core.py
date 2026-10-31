@@ -11,18 +11,7 @@ import ctypes.util
 import os
 
 AGENTBOX_ID_LEN = 64
-AGENTBOX_TAG_LEN = 128
 AGENTBOX_PATH_LEN = 4096
-AGENTBOX_MAX_CHECKPOINTS = 256
-
-
-class AgentboxCheckpoint(ctypes.Structure):
-    _fields_ = [
-        ("id", ctypes.c_char * AGENTBOX_ID_LEN),
-        ("tag", ctypes.c_char * AGENTBOX_TAG_LEN),
-        ("layer_dir", ctypes.c_char * AGENTBOX_PATH_LEN),
-        ("created_at_ms", ctypes.c_longlong),
-    ]
 
 
 class AgentboxExecResult(ctypes.Structure):
@@ -43,8 +32,6 @@ class AgentboxBox(ctypes.Structure):
         ("supervisor_pid", ctypes.c_int),  # pid_t is a 32-bit int on Linux
         ("ctrl_fd", ctypes.c_int),
         ("active", ctypes.c_int),
-        ("checkpoints", AgentboxCheckpoint * AGENTBOX_MAX_CHECKPOINTS),
-        ("checkpoint_count", ctypes.c_int),
     ]
 
 

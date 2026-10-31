@@ -40,7 +40,7 @@ typedef enum {
     AGENTBOX_ERR_INVALID_ARGUMENT = 8,
     AGENTBOX_ERR_FILESYSTEM_MISMATCH = 9,     /* workspace_dir/runtime_dir not on the same st_dev */
     AGENTBOX_ERR_PERMISSION_DENIED = 10,
-    AGENTBOX_ERR_CHECKPOINT_LIMIT_REACHED = 11 /* checkpoint_count == AGENTBOX_MAX_CHECKPOINTS */
+    AGENTBOX_ERR_CHECKPOINT_LIMIT_REACHED = 11 /* supervisor already holds AGENTBOX_MAX_CHECKPOINTS checkpoints */
 } agentbox_errcode_t;
 
 /*
@@ -96,6 +96,10 @@ typedef struct {
     char stderr_path[AGENTBOX_PATH_LEN];
 } agentbox_exec_result_t;
 
+/* Client-side handle. Deliberately holds no copy of the checkpoint list:
+ * the supervisor owns that state, and a fixed AGENTBOX_MAX_CHECKPOINTS
+ * mirror here cost ~1 MB per Sandbox whether checkpoints were used or not
+ * (see docs/benchmarks/concurrency.md). */
 typedef struct {
     char workspace_dir[AGENTBOX_PATH_LEN];
     char runtime_dir[AGENTBOX_PATH_LEN];
@@ -103,8 +107,6 @@ typedef struct {
     pid_t supervisor_pid;
     int  ctrl_fd;
     int  active;
-    agentbox_checkpoint_t checkpoints[AGENTBOX_MAX_CHECKPOINTS];
-    int  checkpoint_count;
 } agentbox_t;
 
 /* ---- Public API (client-side; implemented in agentbox_core.c) ---------- */
